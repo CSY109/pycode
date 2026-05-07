@@ -1,6 +1,7 @@
 import cv2
 import numpy as np
 import time
+from collections import deque
 from mediapipe import Image, ImageFormat
 from mediapipe.tasks.python import BaseOptions
 from mediapipe.tasks.python.vision import (
@@ -11,6 +12,9 @@ from mediapipe.tasks.python.vision import (
 )
 from mediapipe.tasks.python.vision.hand_landmarker import HandLandmarksConnections
 
+# ============================================================
+# 手指关键点索引
+# ============================================================
 FINGERS = [
     {"name": "thumb",  "mcp": 2,  "pip": 3,  "dip": 3,  "tip": 4},
     {"name": "index",  "mcp": 5,  "pip": 6,  "dip": 7,  "tip": 8},
@@ -19,10 +23,38 @@ FINGERS = [
     {"name": "pinky",  "mcp": 17, "pip": 18, "dip": 19, "tip": 20},
 ]
 
-ANGLE_STRAIGHT = 145    # MCP→PIP→TIP 整体伸直阈值
-DIST_EXTEND   = 0.17    # 指尖到 MCP 距离（伸直>此值）
-DIST_FOLD     = 0.13    # MCP→TIP 距离小于此值视为弯曲
-PALM_CENTER   = [0, 5, 9, 13, 17]  # 掌心参考点
+# ============================================================
+# 每指独立阈值 —— 适应不同手指的解剖差异
+#   angle: 整体伸直度 MCP→PIP→TIP，越大越直
+#   dist:  指尖到 MCP 距离，伸直远 / 弯曲近
+#   dip:   DIP 关节最少角度
+# ============================================================
+FINGER_CFG = {
+    "thumb":  {"angle": 145, "dist": 0.14, "dip": 130},
+    "index":  {"angle": 148, "dist": 0.18, "dip": 138},
+    "middle": {"angle": 148, "dist": 0.18, "dip": 138},
+    "ring":   {"angle": 142, "dist": 0.16, "dip": 132},
+    "pinky":  {"angle": 140, "dist": 0.14, "dip": 128},
+}
+
+DIST_FOLD    = 0.13    # MCP→TIP 小于此值视为明确弯曲
+PALM_CENTER  = [0, 5, 9, 13, 17]
+
+# ============================================================
+# 系统参数
+# ============================================================
+DEBOUNCE_LEN = 2             # 防抖帧数（2帧确认，响应快）
+SMOOTH_ALPHA = 0.65          # 关键点 EMA 平滑系数（0=不平滑, 1=完全平滑）
+CAM_FPS      = 22
+CAM_W, CAM_H = 640, 480
+
+
+class SmoothedLM:
+    """轻量容器：替代 NormalizedLandmark 用于平滑后的坐标"""
+    __slots__ = ('x', 'y')
+    def __init__(self, x, y):
+        self.x = x
+        self.y = y
 
 
 def calc_angle(a, b, c):
@@ -40,61 +72,81 @@ def lm_xy(lm):
             float(lm.y) if lm.y is not None else 0.0)
 
 
-def count_fingers(lms):
-    states = [False] * 5
-    dbg = {}
+def ema_smooth(raw_lms, prev_smoothed, alpha=SMOOTH_ALPHA):
+    """EMA 平滑 21 个关键点坐标，返回 SmoothedLM 列表"""
+    if prev_smoothed is None:
+        return [SmoothedLM(*lm_xy(lm)) for lm in raw_lms]
 
-    # ---- 掌心位置 ----
-    px = sum(lm_xy(lms[i])[0] for i in PALM_CENTER) / len(PALM_CENTER)
-    py = sum(lm_xy(lms[i])[1] for i in PALM_CENTER) / len(PALM_CENTER)
+    result = []
+    for i, lm in enumerate(raw_lms):
+        nx, ny = lm_xy(lm)
+        ox, oy = prev_smoothed[i].x, prev_smoothed[i].y
+        result.append(SmoothedLM(
+            alpha * nx + (1 - alpha) * ox,
+            alpha * ny + (1 - alpha) * oy,
+        ))
+    return result
+
+
+def count_fingers(lms):
+    """基于平滑后的关键点判断每根手指伸出/弯曲"""
+    states = [False] * 5
+
+    px = sum(lms[i].x for i in PALM_CENTER) / len(PALM_CENTER)
+    py = sum(lms[i].y for i in PALM_CENTER) / len(PALM_CENTER)
 
     # ---- 拇指 ----
-    cmc   = lm_xy(lms[1])
-    t_mcp = lm_xy(lms[2])
-    t_ip  = lm_xy(lms[3])
-    t_tip = lm_xy(lms[4])
-    idx5  = lm_xy(lms[5])
+    cfg = FINGER_CFG["thumb"]
+    cmc   = (lms[1].x, lms[1].y)
+    t_mcp = (lms[2].x, lms[2].y)
+    t_ip  = (lms[3].x, lms[3].y)
+    t_tip = (lms[4].x, lms[4].y)
+    idx5  = (lms[5].x, lms[5].y)
 
-    a_mcp = calc_angle(cmc, t_mcp, t_ip)   # 拇指 MCP 关节
-    a_ip  = calc_angle(t_mcp, t_ip, t_tip) # 拇指 IP 关节
+    a_mcp = calc_angle(cmc, t_mcp, t_ip)
+    a_ip  = calc_angle(t_mcp, t_ip, t_tip)
     d_idx = np.hypot(t_tip[0] - idx5[0], t_tip[1] - idx5[1])
 
-    # 拇指尖vs掌心：真正伸出时拇指尖比 MCP 离掌心更远
     d_palm_mcp = np.hypot(t_mcp[0] - px, t_mcp[1] - py)
     d_palm_tip = np.hypot(t_tip[0] - px, t_tip[1] - py)
 
-    thumb_ok = a_ip > ANGLE_STRAIGHT and a_mcp > 140 and d_idx > 0.14 and d_palm_tip > d_palm_mcp
-    states[0] = thumb_ok
-    dbg["thumb"] = f"ip={a_ip:.0f} mcp={a_mcp:.0f} d={d_idx:.2f} pt={d_palm_tip:.2f}>{d_palm_mcp:.2f}"
+    states[0] = (
+        a_ip > cfg["angle"]
+        and a_mcp > 138
+        and d_idx > cfg["dist"]
+        and d_palm_tip > d_palm_mcp
+    )
 
-    # ---- 四指（用整体伸直度代替拆分的 PIP/DIP） ----
+    # ---- 四指 ----
     folded_count = 0
     for fi in [1, 2, 3, 4]:
         f = FINGERS[fi]
-        mcp = lm_xy(lms[f["mcp"]])
-        pip = lm_xy(lms[f["pip"]])
-        dip = lm_xy(lms[f["dip"]])
-        tip = lm_xy(lms[f["tip"]])
+        cfg = FINGER_CFG[f["name"]]
 
-        # 整体伸直度：MCP→PIP→TIP 三点一线时角度接近 180°
+        mcp = (lms[f["mcp"]].x, lms[f["mcp"]].y)
+        pip = (lms[f["pip"]].x, lms[f["pip"]].y)
+        dip = (lms[f["dip"]].x, lms[f["dip"]].y)
+        tip = (lms[f["tip"]].x, lms[f["tip"]].y)
+
         a_overall = calc_angle(mcp, pip, tip)
-        a_dip     = calc_angle(pip, dip, tip)  # DIP 单独辅助判断
-        d_tip     = np.hypot(tip[0] - mcp[0], tip[1] - mcp[1])
+        a_dip     = calc_angle(pip, dip, tip)
+        d_mcp_tip = np.hypot(tip[0] - mcp[0], tip[1] - mcp[1])
 
-        dbg[f["name"]] = f"a={a_overall:.0f} dip={a_dip:.0f} d={d_tip:.2f}"
+        ext = (
+            a_overall > cfg["angle"]
+            and d_mcp_tip > cfg["dist"]
+            and a_dip > cfg["dip"]
+        )
+        states[fi] = ext
 
-        # 伸直条件：整体直线度高 + 指尖离 MCP 足够远 + DIP 不能太弯
-        extended = a_overall > ANGLE_STRAIGHT and d_tip > DIST_EXTEND and a_dip > 135
-        states[fi] = extended
-
-        if not extended and d_tip < DIST_FOLD:
+        if not ext and d_mcp_tip < DIST_FOLD:
             folded_count += 1
 
-    # 互锁：四指全弯时拇指几乎不可能单独伸出
+    # 互锁
     if folded_count >= 4 and states[0]:
         states[0] = False
 
-    return states, dbg
+    return states
 
 
 def status_text(n):
@@ -106,10 +158,14 @@ def status_text(n):
 
 
 def main():
-    cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
+    cap = cv2.VideoCapture(0)
     if not cap.isOpened():
         print("Cannot open camera")
         return
+
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH,  CAM_W)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAM_H)
+    cap.set(cv2.CAP_PROP_FPS, CAM_FPS)
 
     WIN = "Hand Detection"
     cv2.namedWindow(WIN, cv2.WINDOW_NORMAL)
@@ -119,32 +175,37 @@ def main():
         base_options=BaseOptions(model_asset_path=r"e:\develop\pycode\hand_landmarker.task"),
         running_mode=RunningMode.VIDEO,
         num_hands=1,
-        min_hand_detection_confidence=0.7,
-        min_hand_presence_confidence=0.5,
-        min_tracking_confidence=0.7,
+        min_hand_detection_confidence=0.8,   # 提高：减少无手误检
+        min_hand_presence_confidence=0.6,    # 略提：手在画面中更稳定
+        min_tracking_confidence=0.6,         # 降低：快速移动时不易丢跟踪
     )
     landmarker = HandLandmarker.create_from_options(opts)
+
     t0 = time.time()
     running = True
+    count_ring = deque(maxlen=DEBOUNCE_LEN)
+    stable_count = 0
+    smoothed = None  # 上一帧平滑后的 21 个关键点
 
     while running:
-        ret, frame = cap.read()
+        ret, raw = cap.read()
         if not ret:
             break
 
+        frame = cv2.resize(raw, (CAM_W, CAM_H))
         frame = cv2.flip(frame, 1)
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         mp_img = Image(image_format=ImageFormat.SRGB, data=rgb)
         ts = int((time.time() - t0) * 1000)
         result = landmarker.detect_for_video(mp_img, ts)
 
-        count = 0
-        status = "No Hand"
-        debug_lines = []
+        h, w, _ = frame.shape
+        raw_count = -1
+        hand_active = bool(result.hand_landmarks)
 
-        if result.hand_landmarks:
+        if hand_active:
             for hand_lm in result.hand_landmarks:
-                # 画骨架
+                # 画原始骨架（原始坐标，兼容 drawing_utils）
                 drawing_utils.draw_landmarks(
                     frame, hand_lm,
                     HandLandmarksConnections.HAND_CONNECTIONS,
@@ -152,63 +213,47 @@ def main():
                     drawing_utils.DrawingSpec(color=(0, 0, 255), thickness=2),
                 )
 
-                states, angles = count_fingers(hand_lm)
-                count = sum(states)
-                status = status_text(count)
-                debug_lines = [f"{k}: {v}" for k, v in angles.items()]
+                # EMA 平滑用于手指判断
+                smoothed = ema_smooth(hand_lm, smoothed)
+                states = count_fingers(smoothed)
+                raw_count = sum(states)
 
-                h, w, _ = frame.shape
-
-                # 每根手指的 MCP 和 TIP 标编号
-                for fi in [0, 1, 2, 3, 4]:
-                    f = FINGERS[fi]
-                    for label, idx in [("M", f["mcp"]), ("T", f["tip"])]:
-                        lm = hand_lm[idx]
-                        cx = int((lm.x if lm.x is not None else 0) * w)
-                        cy = int((lm.y if lm.y is not None else 0) * h)
-                        cv2.putText(frame, f"{fi}{label}", (cx + 10, cy - 10),
-                                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
-
-                # 指尖圆点：绿色伸出，红色弯曲
+                # 指尖圆点（用平滑坐标）
                 for i, f_cfg in enumerate(FINGERS):
-                    lm_tip = hand_lm[f_cfg["tip"]]
-                    cx = int((lm_tip.x if lm_tip.x is not None else 0) * w)
-                    cy = int((lm_tip.y if lm_tip.y is not None else 0) * h)
+                    lm_tip = smoothed[f_cfg["tip"]]
+                    cx = int(lm_tip.x * w)
+                    cy = int(lm_tip.y * h)
                     color = (0, 255, 0) if states[i] else (0, 0, 255)
                     cv2.circle(frame, (cx, cy), 8, color, -1)
+        else:
+            smoothed = None   # 手消失时重置平滑器
 
-        # ---- 右侧调试面板 ----
-        h, w, _ = frame.shape
-        if debug_lines:
-            panel_w = 200
-            canvas = np.zeros((h, w + panel_w, 3), dtype=np.uint8)
-            canvas[0:h, 0:w] = frame
-            cv2.rectangle(canvas, (w, 0), (w + panel_w, h), (30, 30, 30), -1)
-            y = 25
-            for line in debug_lines:
-                cv2.putText(canvas, line, (w + 8, y),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.42, (255, 255, 0), 1)
-                y += 20
-            frame = canvas
-            w += panel_w
+        # ---- 防抖 ----
+        count_ring.append(raw_count)
+        if hand_active and len(count_ring) == DEBOUNCE_LEN and len(set(count_ring)) == 1:
+            stable_count = count_ring[0]
+        elif not hand_active:
+            stable_count = -1
 
-        # ---- 底部状态栏 ----
+        status = "No Hand" if stable_count == -1 else status_text(stable_count)
+
+        # 底部状态栏
         bar = np.zeros((60, w, 3), dtype=np.uint8)
         bar[:] = (40, 40, 40)
-        cv2.putText(bar, f"Fingers: {count}  |  {status}",
+        cv2.putText(bar, f"Fingers: {stable_count}  |  {status}",
                     (20, 40), cv2.FONT_HERSHEY_DUPLEX, 1.1, (0, 255, 255), 2)
         frame = np.vstack([frame, bar])
 
         cv2.imshow(WIN, frame)
 
-        cv2.waitKey(1)
+        cv2.waitKey(max(1, 1000 // CAM_FPS))
         try:
             if cv2.getWindowProperty(WIN, cv2.WND_PROP_VISIBLE) <= 0:
                 running = False
         except cv2.error:
             running = False
 
-    # 清理——不阻塞，避免卡住
+    # 清理
     try:
         landmarker.close()
     except Exception:
